@@ -204,6 +204,20 @@ class Config(object):
             self.max_epoch = conf.getint('HAN', 'max_epoch')
             self.mini_batch_flag = conf.getboolean("HAN", "mini_batch_flag")
 
+        elif self.model_name == 'RoHe':
+            self.lr = conf.getfloat("RoHe", "learning_rate")
+            self.weight_decay = conf.getfloat("RoHe", "weight_decay")
+            self.seed = conf.getint("RoHe", "seed")
+            self.dropout = conf.getfloat("RoHe", "dropout")
+
+            self.hidden_dim = conf.getint('RoHe', 'hidden_dim')
+            self.out_dim = conf.getint('RoHe', 'out_dim')
+            num_heads = conf.get('RoHe', 'num_heads').split('-')
+            self.num_heads = [int(i) for i in num_heads]
+            self.patience = conf.getint('RoHe', 'patience')
+            self.max_epoch = conf.getint('RoHe', 'max_epoch')
+            self.mini_batch_flag = conf.getboolean("RoHe", "mini_batch_flag")
+
         elif self.model_name == 'NARS':
             self.lr = conf.getfloat("NARS", "learning_rate")
             self.weight_decay = conf.getfloat("NARS", "weight_decay")
