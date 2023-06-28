@@ -1,14 +1,22 @@
-import dgl
-import torch as th
-from torch import nn
-from tqdm import tqdm
 import torch
-import torch.nn.functional as F
+import dgl
 import numpy as np
+import os
+from dgl.data.utils import download, _get_dgl_url
+from scipy import io as sio
+from tqdm import tqdm
 import scipy.sparse as sp
+from sklearn.metrics import f1_score
+import random
+import pickle as pkl
+import copy
+import warnings
+
 from . import BaseFlow, register_flow
 from ..models import build_model
-from ..utils import EarlyStopping, add_reverse_edges, get_ntypes_from_canonical_etypes
+from ..layers.HeteroLinear import HeteroFeature
+from ..utils import EarlyStopping
+from ..utils.utils import get_nodes_dict
 
 
 @register_flow("RoHe_trainer")
@@ -33,20 +41,8 @@ class RoHeTrainer(BaseFlow):
         self.hete_adjs = self.load_acm()
         self.args.settings = self.setup_settings()
 
-        import copy
-        t_args = copy.deepcopy(self.args)
-        t_hg = copy.deepcopy(self.hg)
+        self.raw = True
         self.raw_model = build_model('HAN').build_model_from_args(self.args, self.hg).to(self.device)
-        from ..layers.HeteroLinear import HeteroFeature
-        from ..utils.utils import get_nodes_dict
-        input_feature = HeteroFeature(self.hg.ndata['h'], get_nodes_dict(self.hg), self.args.hidden_dim, act=None)
-        self.raw_model.add_module('input_feature', input_feature)
-        save_path = '/home/yds/projects/openhgnn/openhgnn/output/HAN/HAN_acm_han_raw_node_classification.pt'
-        self.raw_model.load_state_dict(th.load(save_path, map_location=self.device))
-        self.raw_model.to(self.device)
-
-        self.args = copy.deepcopy(t_args)
-        self.hg = copy.deepcopy(t_hg)
         self.model = build_model(self.model).build_model_from_args(self.args, self.hg).to(self.device)
 
         self.optimizer = self.candidate_optimizer[args.optimizer](self.model.parameters(),
@@ -80,12 +76,10 @@ class RoHeTrainer(BaseFlow):
                     batch_size=self.args.batch_size, device=self.device, shuffle=True)
 
     def preprocess(self):
-
         super(RoHeTrainer, self).preprocess()
 
     def train(self):
         self.preprocess()  # 见*.md
-        # self._checkpoint = '/home/yds/projects/openhgnn/openhgnn/output/RoHe/mid_routdglHan_hyper_acm.ph'
         stopper = EarlyStopping(self.args.patience, self._checkpoint)
         epoch_iter = tqdm(range(self.max_epoch))
         for epoch in epoch_iter:
@@ -115,6 +109,22 @@ class RoHeTrainer(BaseFlow):
                     break
 
         stopper.load_model(self.model)
+        input_feature = HeteroFeature(self.hg.ndata['h'], get_nodes_dict(self.hg), self.args.hidden_dim, act=None)
+        self.raw_model.add_module('input_feature', input_feature)
+        try:
+            save_path = './openhgnn/output/HAN/HAN_acm_han_raw_node_classification.pt'
+            self.raw_model.load_state_dict(torch.load(save_path, map_location=self.device))
+            self.raw_model.to(self.device)
+        except FileNotFoundError:
+            self.raw = False
+            print(
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                "\tFailed to import raw-HAN parameters. \n "
+                "\tThe results output will no longer include the comparison of raw-HAN. \n"
+                "\tPlease try running [model: HAN, task: node_classification, dataset: acm_han_raw] first \n"
+                "\t\tto generate the checkpoint file HAN_acm_han_raw_node_classificationtest.pt.\n"
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            )
 
         if self.args.prediction_flag:
             if self.args.mini_batch_flag and hasattr(self, 'val_loader'):
@@ -143,164 +153,8 @@ class RoHeTrainer(BaseFlow):
             else:
                 metric_dict, _ = self._full_test_step(modes=['valid', 'test'])
             self.logger.train_info('[Test Info]' + self.logger.metric2str(metric_dict))
-            self.generate_attacks_metric_dict(raw=True)
+            self.generate_attacks_metric_dict(self.raw)
             return dict(metric=metric_dict, epoch=epoch)
-
-    def get_transition(self, given_hete_adjs, metapath_info):
-        # transition
-        hete_adj_dict_tmp = {}
-        for key in given_hete_adjs.keys():
-            deg = given_hete_adjs[key].sum(1)
-            hete_adj_dict_tmp[key] = given_hete_adjs[key] / (np.where(deg > 0, deg, 1))  # make sure deg>0
-        homo_adj_list = []
-        for i in range(len(metapath_info)):
-            adj = hete_adj_dict_tmp[metapath_info[i][0]]
-            for etype in metapath_info[i][1:]:
-                adj = adj.dot(hete_adj_dict_tmp[etype])
-            homo_adj_list.append(sp.csc_matrix(adj))
-        return homo_adj_list
-
-    def setup_settings(self):
-        settings_pap = {'T': 2}  # acm
-        settings_psp = {'T': 5}  # acm
-        settings = [settings_pap, settings_psp]
-        meta_paths_dict = {'acm_han_raw': [['pa', 'ap'], ['pf', 'fp']]}
-        trans_adj_list = self.get_transition(self.hete_adjs, meta_paths_dict['acm_han_raw'])
-        for i in range(len(trans_adj_list)):
-            settings[i]['device'] = self.device
-            settings[i]['TransM'] = trans_adj_list[i]
-        return settings
-
-    def get_hg(self, given_adj_dict):
-        hg_new = dgl.heterograph({
-            ('paper', 'pa', 'author'): given_adj_dict['pa'].nonzero(),
-            ('author', 'ap', 'paper'): given_adj_dict['ap'].nonzero(),
-            ('paper', 'pf', 'field'): given_adj_dict['pf'].nonzero(),
-            ('field', 'fp', 'paper'): given_adj_dict['fp'].nonzero(),
-        })
-        return hg_new
-
-    def score(self, logits, labels):
-        from sklearn.metrics import f1_score
-        _, indices = torch.max(logits, dim=1)
-        prediction = indices.long().cpu().numpy()
-        labels = labels.cpu().numpy()
-        accuracy = (prediction == labels).sum() / len(prediction)
-        micro_f1 = f1_score(labels, prediction, average='micro')
-        macro_f1 = f1_score(labels, prediction, average='macro')
-        return accuracy, micro_f1, macro_f1
-
-    def load_acm(self, remove_self_loop=False):
-        assert not remove_self_loop
-        import os
-        from dgl.data.utils import download, get_download_dir, _get_dgl_url
-        from scipy import io as sio
-        url = 'dataset/ACM.mat'
-        data_path = './openhgnn/dataset/ACM.mat'
-        if not os.path.exists(data_path):
-            download(_get_dgl_url(url), path=data_path)
-
-        data = sio.loadmat(data_path)
-        p_vs_l = data['PvsL']  # paper-field?
-        p_vs_a = data['PvsA']  # paper-author
-        p_vs_t = data['PvsT']  # paper-term, bag of words
-        p_vs_c = data['PvsC']  # paper-conference, labels come from that
-
-        conf_ids = [0, 1, 9, 10, 13]
-        label_ids = [0, 1, 2, 2, 1]
-
-        p_vs_c_filter = p_vs_c[:, conf_ids]
-        p_selected = (p_vs_c_filter.sum(1) != 0).A1.nonzero()[0]
-        p_vs_l = p_vs_l[p_selected]
-        p_vs_a = p_vs_a[p_selected]
-        p_vs_t = p_vs_t[p_selected]
-        p_vs_c = p_vs_c[p_selected]
-        hete_adjs = {'pa': p_vs_a, 'ap': p_vs_a.T,
-                     'pf': p_vs_l, 'fp': p_vs_l.T}
-        return hete_adjs
-
-    def generate_attacks_metric_dict(self, raw=False):
-        import random
-        import pickle as pkl
-        import copy
-        import numpy as np
-        import warnings
-        warnings.filterwarnings('ignore')
-
-        tar_idx = sorted(random.sample(range(self.hg.num_nodes(self.category)), 100))
-        print(
-            "Note that Raw-HAN is only for better comparison with RoHe-HAN "
-            "(Raw-HAN is not necessarily the best performance, don't care about the value, "
-            "and pay more attention to the trend of changes before and after)"
-        )
-        with torch.no_grad():
-            if raw:
-                h_dict = self.raw_model.input_feature()
-                logits = self.raw_model(self.hg, h_dict)[self.category]
-                _, micro_f1, macro_f1 = self.score(logits[tar_idx], self.labels[tar_idx])
-                print("Raw-HAN in raw data:  Micro-F1:", micro_f1, " Macro-F1:", macro_f1)
-            h_dict = self.model.input_feature()
-            logits = self.model(self.hg, h_dict)[self.category]
-            _, micro_f1, macro_f1 = self.score(logits[tar_idx], self.labels[tar_idx])
-            print("RoHe-HAN in raw data:  Micro-F1:", micro_f1, " Macro-F1:", macro_f1)
-
-        n_perturbation = 1
-        adv_filename = '/home/yds/projects/openhgnn/openhgnn/output/RoHe/adv_acm_pap_pa_' + str(n_perturbation) + '.pkl'
-        # load adversarial attacks for each target node
-        with open(adv_filename, 'rb') as f:
-            modified_opt = pkl.load(f)
-        # 2.attack
-        logits_adv = []
-        labels_adv = []
-        if raw:
-            raw_logits_adv = []
-            raw_labels_adv = []
-        modified_opt_iter = tqdm(modified_opt)
-        for items in modified_opt_iter:
-            # 2.1 init
-            target_node = items[0]
-            del_list = items[2]
-            add_list = items[3]
-            if target_node not in tar_idx:
-                continue
-            # 2.2 attack adjs
-            mod_hete_adj_dict = copy.deepcopy(self.hete_adjs)
-            for edge in del_list:
-                mod_hete_adj_dict['pa'][edge[0], edge[1]] = 0
-                mod_hete_adj_dict['ap'][edge[1], edge[0]] = 0
-            for edge in add_list:
-                mod_hete_adj_dict['pa'][edge[0], edge[1]] = 1
-                mod_hete_adj_dict['ap'][edge[1], edge[0]] = 1
-            meta_paths_dict = {'acm_han_raw': [['pa', 'ap'], ['pf', 'fp']]}
-
-            trans_adj_list = self.get_transition(mod_hete_adj_dict, meta_paths_dict['acm_han_raw'])
-            for i in range(len(self.model.mod_dict['paper'].layers)):
-                self.model.mod_dict['paper'].layers[i].model.mods['PAP'].settings['TransM'] = trans_adj_list[0]
-                self.model.mod_dict['paper'].layers[i].model.mods['PFP'].settings['TransM'] = trans_adj_list[1]
-
-            self.hg = self.get_hg(mod_hete_adj_dict).to(self.device)
-            # 2.3 run model
-            with torch.no_grad():
-                h_dict = self.model.input_feature()
-                logits = self.model(self.hg, h_dict)[self.category]
-                if raw:
-                    raw_logits = self.raw_model(self.hg, h_dict)[self.category]
-            # 2.4 evaluate
-            logits_adv.append(logits[np.array([[target_node]])])
-            labels_adv.append(self.labels[np.array([[target_node]])])
-            if raw:
-                raw_logits_adv.append(raw_logits[np.array([[target_node]])])
-                raw_labels_adv.append(self.labels[np.array([[target_node]])])
-        logits_adv = torch.cat(logits_adv, 0)
-        labels_adv = torch.cat(labels_adv)
-        if raw:
-            raw_logits_adv = torch.cat(raw_logits_adv, 0)
-            raw_labels_adv = torch.cat(raw_labels_adv)
-        _, tar_micro_f1_atk, tar_macro_f1_atk = self.score(logits_adv, labels_adv)
-        if raw:
-            _, raw_tar_micro_f1_atk, raw_tar_macro_f1_atk = self.score(raw_logits_adv, raw_labels_adv)
-            print("Raw-HAN in attacked data:  Micro-F1:", raw_tar_micro_f1_atk, " Macro-F1:", raw_tar_macro_f1_atk)
-        print("RoHe-HAN in attacked data:  Micro-F1:", tar_micro_f1_atk, " Macro-F1:", tar_macro_f1_atk)
 
     def _full_train_step(self):
         self.model.train()
@@ -430,3 +284,151 @@ class RoHeTrainer(BaseFlow):
             indices = torch.cat(indices, dim=0)
             y_predicts = torch.cat(y_predicts, dim=0)
         return indices, y_predicts
+
+    def get_transition(self, given_hete_adjs, metapath_info):
+        # transition
+        hete_adj_dict_tmp = {}
+        for key in given_hete_adjs.keys():
+            deg = given_hete_adjs[key].sum(1)
+            hete_adj_dict_tmp[key] = given_hete_adjs[key] / (np.where(deg > 0, deg, 1))  # make sure deg>0
+        homo_adj_list = []
+        for i in range(len(metapath_info)):
+            adj = hete_adj_dict_tmp[metapath_info[i][0]]
+            for etype in metapath_info[i][1:]:
+                adj = adj.dot(hete_adj_dict_tmp[etype])
+            homo_adj_list.append(sp.csc_matrix(adj))
+        return homo_adj_list
+
+    def setup_settings(self):
+        settings_pap = {'T': 2}  # acm
+        settings_psp = {'T': 5}  # acm
+        settings = [settings_pap, settings_psp]
+        meta_paths_dict = {'acm_han_raw': [['pa', 'ap'], ['pf', 'fp']]}
+        trans_adj_list = self.get_transition(self.hete_adjs, meta_paths_dict['acm_han_raw'])
+        for i in range(len(trans_adj_list)):
+            settings[i]['device'] = self.device
+            settings[i]['TransM'] = trans_adj_list[i]
+        return settings
+
+    def get_hg(self, given_adj_dict):
+        hg_new = dgl.heterograph({
+            ('paper', 'pa', 'author'): given_adj_dict['pa'].nonzero(),
+            ('author', 'ap', 'paper'): given_adj_dict['ap'].nonzero(),
+            ('paper', 'pf', 'field'): given_adj_dict['pf'].nonzero(),
+            ('field', 'fp', 'paper'): given_adj_dict['fp'].nonzero(),
+        })
+        return hg_new
+
+    def score(self, logits, labels):
+        _, indices = torch.max(logits, dim=1)
+        prediction = indices.long().cpu().numpy()
+        labels = labels.cpu().numpy()
+        accuracy = (prediction == labels).sum() / len(prediction)
+        micro_f1 = f1_score(labels, prediction, average='micro')
+        macro_f1 = f1_score(labels, prediction, average='macro')
+        return accuracy, micro_f1, macro_f1
+
+    def load_acm(self, remove_self_loop=False):
+        assert not remove_self_loop
+        url = 'dataset/ACM.mat'
+        data_path = './openhgnn/dataset/ACM.mat'
+        if not os.path.exists(data_path):
+            download(_get_dgl_url(url), path=data_path)
+
+        data = sio.loadmat(data_path)
+        p_vs_l = data['PvsL']  # paper-field
+        p_vs_a = data['PvsA']  # paper-author
+        p_vs_t = data['PvsT']  # paper-term, bag of words
+        p_vs_c = data['PvsC']  # paper-conference, labels come from that
+
+        conf_ids = [0, 1, 9, 10, 13]
+
+        p_vs_c_filter = p_vs_c[:, conf_ids]
+        p_selected = (p_vs_c_filter.sum(1) != 0).A1.nonzero()[0]
+        p_vs_l = p_vs_l[p_selected]
+        p_vs_a = p_vs_a[p_selected]
+        hete_adjs = {'pa': p_vs_a, 'ap': p_vs_a.T,
+                     'pf': p_vs_l, 'fp': p_vs_l.T}
+        return hete_adjs
+
+    def generate_attacks_metric_dict(self, raw=False):
+        warnings.filterwarnings('ignore')
+        tar_nodes_num = 100
+        tar_idx = sorted(random.sample(range(self.hg.num_nodes(self.category)), tar_nodes_num))
+        if raw:
+            print(
+                "Note that:\n"
+                "\t Raw-HAN is only for better comparison with RoHe-HAN. \n"
+                "\t(Raw-HAN is not necessarily the best performance, don't care about the value,"
+                "and pay more attention to the trend of changes before and after)"
+            )
+        with torch.no_grad():
+            if raw:
+                h_dict = self.raw_model.input_feature()
+                logits = self.raw_model(self.hg, h_dict)[self.category]
+                _, micro_f1, macro_f1 = self.score(logits[tar_idx], self.labels[tar_idx])
+                print(f"Raw-HAN in raw data:  Micro-F1: {micro_f1:.3f} Macro-F1: {macro_f1:.3f}")
+            h_dict = self.model.input_feature()
+            logits = self.model(self.hg, h_dict)[self.category]
+            _, micro_f1, macro_f1 = self.score(logits[tar_idx], self.labels[tar_idx])
+            print(f"RoHe-HAN in raw data:  Micro-F1: {micro_f1:.3f} Macro-F1: {macro_f1:.3f}")
+
+        n_perturbation = 1
+        adv_filename = './openhgnn/output/RoHe/adv_acm_pap_pa_' + str(n_perturbation) + '.pkl'
+        # load adversarial attacks for each target node
+        with open(adv_filename, 'rb') as f:
+            modified_opt = pkl.load(f)
+        # 2.attack
+        logits_adv = []
+        labels_adv = []
+        if raw:
+            raw_logits_adv = []
+            raw_labels_adv = []
+        modified_opt_iter = tqdm(modified_opt)
+        for items in modified_opt_iter:
+            # 2.1 init
+            target_node = items[0]
+            del_list = items[2]
+            add_list = items[3]
+            if target_node not in tar_idx:
+                continue
+            # 2.2 attack adjs
+            mod_hete_adj_dict = copy.deepcopy(self.hete_adjs)
+            for edge in del_list:
+                mod_hete_adj_dict['pa'][edge[0], edge[1]] = 0
+                mod_hete_adj_dict['ap'][edge[1], edge[0]] = 0
+            for edge in add_list:
+                mod_hete_adj_dict['pa'][edge[0], edge[1]] = 1
+                mod_hete_adj_dict['ap'][edge[1], edge[0]] = 1
+            meta_paths_dict = {'acm_han_raw': [['pa', 'ap'], ['pf', 'fp']]}
+
+            trans_adj_list = self.get_transition(mod_hete_adj_dict, meta_paths_dict['acm_han_raw'])
+            for i in range(len(self.model.mod_dict['paper'].layers)):
+                self.model.mod_dict['paper'].layers[i].model.mods['PAP'].settings['TransM'] = trans_adj_list[0]
+                self.model.mod_dict['paper'].layers[i].model.mods['PFP'].settings['TransM'] = trans_adj_list[1]
+
+            self.hg = self.get_hg(mod_hete_adj_dict).to(self.device)
+            # 2.3 run model
+            with torch.no_grad():
+                h_dict = self.model.input_feature()
+                logits = self.model(self.hg, h_dict)[self.category]
+                if raw:
+                    raw_logits = self.raw_model(self.hg, h_dict)[self.category]
+            # 2.4 evaluate
+            logits_adv.append(logits[np.array([[target_node]])])
+            labels_adv.append(self.labels[np.array([[target_node]])])
+            if raw:
+                raw_logits_adv.append(raw_logits[np.array([[target_node]])])
+                raw_labels_adv.append(self.labels[np.array([[target_node]])])
+
+        if raw:
+            raw_logits_adv = torch.cat(raw_logits_adv, 0)
+            raw_labels_adv = torch.cat(raw_labels_adv)
+            _, raw_tar_micro_f1_atk, raw_tar_macro_f1_atk = self.score(raw_logits_adv, raw_labels_adv)
+            print(
+                f"Raw-HAN in attacked data:  Micro-F1: {raw_tar_micro_f1_atk:.3f} Macro-F1: {raw_tar_macro_f1_atk:.3f}")
+
+        logits_adv = torch.cat(logits_adv, 0)
+        labels_adv = torch.cat(labels_adv)
+        _, tar_micro_f1_atk, tar_macro_f1_atk = self.score(logits_adv, labels_adv)
+        print(f"RoHe-HAN in attacked data:  Micro-F1: {tar_micro_f1_atk:.3f} Macro-F1: {tar_macro_f1_atk:.3f}")
